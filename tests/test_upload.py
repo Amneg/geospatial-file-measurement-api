@@ -92,7 +92,7 @@ def test_valid_kml_upload_and_feature_extraction(api):
     metadata = response.json()
     assert metadata["id"] > 0
     assert metadata["filename"] == "sample.kml"
-    assert metadata["source_crs"] == "EPSG:4326"
+    assert metadata["crs"] == "EPSG:4326"
     assert metadata["feature_count"] == 3
     assert metadata["status"] == "COMPLETED"
     assert metadata["uploaded_at"]
@@ -133,7 +133,7 @@ def test_valid_nested_shapefile_zip_and_attributes(api, shapefile_parts, upperca
     response = upload(client, "places.ZIP", data)
     assert response.status_code == 201, response.text
     assert response.json()["feature_count"] == 2
-    assert response.json()["source_crs"] == "EPSG:4326"
+    assert response.json()["crs"] == "EPSG:4326"
     with sessions() as db:
         features = db.query(models.Feature).order_by(models.Feature.id).all()
         assert [feature.source_feature_id for feature in features] == ["0", "1"]
@@ -158,7 +158,7 @@ def test_unique_ids_and_saved_names(api):
 def test_unsupported_extension(api, filename):
     client, sessions, upload_directory = api
     response = upload(client, filename, b"some data")
-    assert response.status_code == 415
+    assert response.status_code == 400
     assert "Unsupported file type" in response.json()["detail"]
     assert_no_saved_data(sessions, upload_directory)
 
@@ -261,7 +261,7 @@ def test_projected_source_crs_and_coordinates_are_preserved(api, tmp_path):
     parts = {path.name: path.read_bytes() for path in directory.iterdir()}
     response = upload(client, "survey.zip", make_zip(parts))
     assert response.status_code == 201, response.text
-    assert response.json()["source_crs"] == "EPSG:32643"
+    assert response.json()["crs"] == "EPSG:32643"
     with sessions() as db:
         feature = db.query(models.Feature).one()
         assert feature.geometry["coordinates"] == [500000, 3000000]
@@ -334,6 +334,12 @@ def test_missing_and_collection_geometries_are_preserved(api, placemark_geometry
             assert feature.geometry["type"] == "GeometryCollection"
         assert feature.area_m2 is None and feature.length_m is None
         assert feature.measurement_status == "UNSUPPORTED"
+    measurements = client.get(f"/api/files/{response.json()['id']}/measurements/")
+    assert measurements.status_code == 200
+    feature = measurements.json()["features"][0]
+    assert feature["geometry_type"] == expected_type
+    assert feature["measurement_status"] == "UNSUPPORTED"
+    assert feature["area_m2"] is None and feature["length_m"] is None
 
 
 def test_invalid_shapefile_crs(api, shapefile_parts):
@@ -372,3 +378,110 @@ def test_measurement_crs_failure_cleans_up_upload(api):
     assert response.status_code == 400
     assert "UTM CRS" in response.json()["detail"]
     assert_no_saved_data(sessions, upload_directory)
+
+
+def test_get_file_metadata_matches_upload_response(api):
+    client, _, _ = api
+    uploaded = upload(client, "sample.kml", KML_DATA)
+    assert uploaded.status_code == 201
+    response = client.get(f"/api/files/{uploaded.json()['id']}/")
+    assert response.status_code == 200
+    assert response.json() == uploaded.json()
+    assert set(response.json()) == {"id", "filename", "feature_count", "crs", "status", "uploaded_at"}
+    assert response.json()["feature_count"] == 3
+    assert response.json()["crs"] == "EPSG:4326"
+    assert response.json()["uploaded_at"].endswith("Z")
+
+
+@pytest.mark.parametrize("suffix", ["", "measurements/"])
+def test_unknown_file_id_returns_404(api, suffix):
+    client, _, _ = api
+    response = client.get(f"/api/files/999999/{suffix}")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "File not found."}
+
+
+def test_get_polygon_line_and_point_measurements(api):
+    client, sessions, _ = api
+    uploaded = upload(client, "sample.kml", KML_DATA)
+    assert uploaded.status_code == 201
+    file_id = uploaded.json()["id"]
+    response = client.get(f"/api/files/{file_id}/measurements/")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["file_id"] == file_id
+    assert body["feature_count"] == len(body["features"]) == 3
+    point, line, polygon = body["features"]
+    assert point["geometry_type"] == "Point"
+    assert point["area_m2"] is None and point["length_m"] is None
+    assert point["measurement_status"] == "NOT_REQUIRED"
+    assert line["geometry_type"] == "LineString"
+    assert line["length_m"] > 0 and line["area_m2"] is None
+    assert line["measurement_status"] == "SUCCESS"
+    assert polygon["geometry_type"] == "Polygon"
+    assert polygon["area_m2"] > 0 and polygon["length_m"] is None
+    assert polygon["measurement_status"] == "SUCCESS"
+    with sessions() as db:
+        stored = db.query(models.Feature).filter_by(file_id=file_id).order_by(models.Feature.id).all()
+        for feature, row in zip(body["features"], stored):
+            assert feature["id"] == row.id
+            assert feature["feature_id"] == row.source_feature_id
+            assert feature["geometry"] == row.geometry
+            assert feature["properties"] == row.properties
+            assert feature["crs"] == "EPSG:4326"
+            assert feature["area_m2"] == row.area_m2
+            assert feature["length_m"] == row.length_m
+
+
+def test_measurements_are_scoped_to_the_requested_file(api):
+    client, _, _ = api
+    first = upload(client, "first.kml", KML_DATA)
+    second = upload(client, "second.kml", KML_DATA)
+    assert first.status_code == second.status_code == 201
+    first_response = client.get(f"/api/files/{first.json()['id']}/measurements/")
+    second_response = client.get(f"/api/files/{second.json()['id']}/measurements/")
+    assert first_response.status_code == second_response.status_code == 200
+    first_features = first_response.json()["features"]
+    second_features = second_response.json()["features"]
+    assert len(first_features) == len(second_features) == 3
+    assert {feature["id"] for feature in first_features}.isdisjoint({feature["id"] for feature in second_features})
+
+
+def test_get_uses_stored_values_without_recalculating(api, monkeypatch):
+    client, sessions, upload_directory = api
+    uploaded = upload(client, "stored.kml", KML_DATA)
+    assert uploaded.status_code == 201
+    file_id = uploaded.json()["id"]
+    with sessions() as db:
+        line = db.query(models.Feature).filter_by(file_id=file_id, geometry_type="LineString").one()
+        polygon = db.query(models.Feature).filter_by(file_id=file_id, geometry_type="Polygon").one()
+        line.length_m = 987.65
+        polygon.area_m2 = 4321.25
+        db.commit()
+
+    def do_not_process_files(*args, **kwargs):
+        raise AssertionError("GET must use stored data without parsing or measuring")
+
+    monkeypatch.setattr(main, "read_features", do_not_process_files)
+    monkeypatch.setattr(geo, "read_features", do_not_process_files)
+    monkeypatch.setattr(geo, "calculate_measurements", do_not_process_files)
+    for saved_file in upload_directory.iterdir():
+        saved_file.unlink()
+    assert client.get(f"/api/files/{file_id}/").status_code == 200
+    response = client.get(f"/api/files/{file_id}/measurements/")
+    assert response.status_code == 200
+    assert response.json()["features"][1]["length_m"] == 987.65
+    assert response.json()["features"][2]["area_m2"] == 4321.25
+
+
+def test_existing_file_with_no_features_returns_empty_measurements(api):
+    client, sessions, _ = api
+    with sessions() as db:
+        file = models.File(filename="empty-dataset.zip", source_crs="EPSG:4326", feature_count=0, status="COMPLETED")
+        db.add(file)
+        db.flush()
+        file_id = file.id
+        db.commit()
+    response = client.get(f"/api/files/{file_id}/measurements/")
+    assert response.status_code == 200
+    assert response.json() == {"file_id": file_id, "feature_count": 0, "features": []}
