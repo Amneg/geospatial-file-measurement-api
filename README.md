@@ -44,10 +44,10 @@ geospatial-api/
 
 ## Local Setup
 
-Use Python 3.12. Replace `<repository-url>` with this repository's clone URL:
+Use Python 3.12. Clone this repository:
 
 ```bash
-git clone <repository-url> geospatial-api
+git clone https://github.com/Amneg/geospatial-file-measurement-api geospatial-api
 cd geospatial-api
 python3 -m venv .venv
 source .venv/bin/activate
