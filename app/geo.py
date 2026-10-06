@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
@@ -6,6 +7,7 @@ from zipfile import BadZipFile, LargeZipFile, ZipFile
 
 import geopandas as gpd
 import pyogrio
+from pyproj.exceptions import ProjError
 
 
 MAX_EXTRACTED_SIZE = 100 * 1024 * 1024
@@ -58,6 +60,69 @@ def extract_shapefile(zip_path: Path, temporary_directory: Path):
         raise ValueError("Corrupt or unsupported ZIP archive.") from error
 
 
+def choose_measurement_crs(geometries: gpd.GeoSeries):
+    source_crs = geometries.crs
+    if source_crs is None:
+        raise ValueError("The dataset CRS is missing or invalid.")
+    if not (source_crs.is_geographic or source_crs.is_projected):
+        raise ValueError("The source CRS is not usable for planar measurements.")
+
+    axes = source_crs.axis_info[:2]
+    if source_crs.is_projected and len(axes) == 2 and all(
+        math.isclose(axis.unit_conversion_factor, 1.0) for axis in axes
+    ):
+        return source_crs
+    if geometries.empty:
+        return None  # Points and unsupported geometries need no measurement CRS.
+
+    try:
+        measurement_crs = geometries.estimate_utm_crs()
+    except (RuntimeError, ValueError, ProjError) as error:
+        raise ValueError("Could not determine a local UTM CRS for this dataset.") from error
+    if measurement_crs is None:
+        raise ValueError("Could not determine a local UTM CRS for this dataset.")
+    return measurement_crs
+
+
+def calculate_measurements(geometries: gpd.GeoSeries):
+    measurable = (
+        geometries.geom_type.isin(["Polygon", "LineString"])
+        & ~geometries.is_empty
+        & geometries.is_valid
+    )
+    measurement_crs = choose_measurement_crs(geometries.loc[measurable])
+    projected = gpd.GeoSeries([], dtype="geometry")
+    if measurable.any():
+        try:
+            # to_crs returns a separate series; original coordinates stay untouched.
+            projected = geometries.loc[measurable].to_crs(measurement_crs)
+        except (ValueError, RuntimeError, ProjError) as error:
+            raise ValueError("Could not transform geometry to the measurement CRS.") from error
+
+    measurements = []
+    for index, geometry in geometries.items():
+        result = {"area_m2": None, "length_m": None, "measurement_status": "UNSUPPORTED"}
+        if geometry is not None:
+            if geometry.geom_type == "Point":
+                result["measurement_status"] = "NOT_REQUIRED"
+            elif geometry.geom_type in {"Polygon", "LineString"}:
+                if geometry.is_empty or not geometry.is_valid:
+                    result["measurement_status"] = "INVALID_GEOMETRY"
+                else:
+                    metric_geometry = projected.loc[index]
+                    if geometry.geom_type == "Polygon":
+                        value = metric_geometry.area
+                        result["area_m2"] = value
+                    else:
+                        value = metric_geometry.length
+                        result["length_m"] = value
+                    if not math.isfinite(value):
+                        raise ValueError("Could not calculate a finite measurement. Check the CRS and coordinates.")
+                    result["measurement_status"] = "SUCCESS"
+        measurements.append(result)
+    return measurements
+
+
 def read_features(dataset_path: Path):
     try:
         layers = pyogrio.list_layers(dataset_path)
@@ -97,4 +162,10 @@ def read_features(dataset_path: Path):
                 "geometry": geometry,
                 "properties": feature["properties"],
             })
+    geometries = gpd.GeoSeries(
+        [geometry for frame in frames for geometry in frame.geometry], crs=source_crs,
+    )
+    measurements = calculate_measurements(geometries)
+    for feature, measurement in zip(features, measurements):
+        feature.update(measurement)
     return source_crs.to_string(), features

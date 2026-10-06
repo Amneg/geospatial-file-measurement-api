@@ -105,11 +105,20 @@ def test_valid_kml_upload_and_feature_extraction(api):
         assert len({feature.source_feature_id for feature in features}) == 3
         assert features[0].geometry["coordinates"][:2] == [77, 28]
         assert features[0].properties["Name"] == "Station"
+        assert features[1].geometry == {
+            "type": "LineString", "coordinates": [[77, 28, 0], [77.1, 28.1, 0]],
+        }
+        assert features[2].geometry == {
+            "type": "Polygon", "coordinates": [[[77, 28, 0], [77.1, 28, 0], [77.1, 28.1, 0], [77, 28, 0]]],
+        }
         for feature in features:
             assert feature.file_id == metadata["id"]
-            assert feature.area_m2 is None
-            assert feature.length_m is None
-            assert feature.measurement_status is None
+        assert features[0].area_m2 is None and features[0].length_m is None
+        assert features[0].measurement_status == "NOT_REQUIRED"
+        assert features[1].length_m > 0 and features[1].area_m2 is None
+        assert features[1].measurement_status == "SUCCESS"
+        assert features[2].area_m2 > 0 and features[2].length_m is None
+        assert features[2].measurement_status == "SUCCESS"
     saved_files = list(upload_directory.iterdir())
     assert len(saved_files) == 1
     assert saved_files[0].name == f"{metadata['id']}.kml"
@@ -257,6 +266,7 @@ def test_projected_source_crs_and_coordinates_are_preserved(api, tmp_path):
         feature = db.query(models.Feature).one()
         assert feature.geometry["coordinates"] == [500000, 3000000]
         assert feature.area_m2 is None and feature.length_m is None
+        assert feature.measurement_status == "NOT_REQUIRED"
 
 
 def test_all_kml_layers_are_read(api):
@@ -323,6 +333,7 @@ def test_missing_and_collection_geometries_are_preserved(api, placemark_geometry
         else:
             assert feature.geometry["type"] == "GeometryCollection"
         assert feature.area_m2 is None and feature.length_m is None
+        assert feature.measurement_status == "UNSUPPORTED"
 
 
 def test_invalid_shapefile_crs(api, shapefile_parts):
@@ -349,4 +360,15 @@ def test_disguised_non_kml_is_rejected(api):
     response = upload(client, "disguised.kml", data)
     assert response.status_code == 400
     assert response.json()["detail"]
+    assert_no_saved_data(sessions, upload_directory)
+
+
+def test_measurement_crs_failure_cleans_up_upload(api):
+    client, sessions, upload_directory = api
+    data = b'''<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+      <Placemark><LineString><coordinates>3,85 3.001,85</coordinates></LineString></Placemark>
+    </Document></kml>'''
+    response = upload(client, "polar.kml", data)
+    assert response.status_code == 400
+    assert "UTM CRS" in response.json()["detail"]
     assert_no_saved_data(sessions, upload_directory)
